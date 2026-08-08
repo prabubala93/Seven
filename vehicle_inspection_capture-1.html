@@ -118,7 +118,7 @@
       <span class="arrow">→</span>
     </button>
     <button class="action-btn" id="btnZip" onclick="generateIndividualZip()">
-      <span class="lbl">Individual Photos<small>6 files zipped · &lt; 1 MB each</small></span>
+      <span class="lbl">Individual Photos<small>6 files zipped · &lt; 500 KB each</small></span>
       <span class="arrow">→</span>
     </button>
   </div>
@@ -230,60 +230,92 @@ function sanitize(s){
 function setLocText(html){ document.getElementById('locText').innerHTML = html; }
 
 async function initLocation(){
-  if(!navigator.geolocation){ setLocText('⚠ Geolocation not supported on this browser'); return; }
-  if(!window.isSecureContext){
-    setLocText('⚠ Location is blocked because this page isn\'t served over HTTPS (opening the file directly counts as insecure on Android). Host it on a web server, or on localhost, to enable GPS.');
-    return;
-  }
   state.location = null;
   state.policeStation = null;
   state.addressStatus = 'idle';
   state.policeStatus = 'idle';
+
+  if(!navigator.geolocation){
+    setLocText('GPS not supported — estimating from network (IP)…');
+    return tryIpFallback();
+  }
+  if(!window.isSecureContext){
+    setLocText('⚠ GPS is blocked because this file was opened locally (Android only allows GPS on HTTPS/localhost pages). Estimating an approximate location from your network instead…');
+    return tryIpFallback();
+  }
   setLocText('<b>Locating…</b> (allow the location permission prompt if asked)');
 
-  navigator.geolocation.getCurrentPosition(async pos=>{
-    const lat = pos.coords.latitude, lon = pos.coords.longitude;
-    state.location = { lat, lon, address: null };
-    state.addressStatus = 'loading';
-    state.policeStatus = 'loading';
-    renderLoc();
-    refreshAllThumbnails();
-
-    reverseGeocode(lat, lon).then(addr=>{
-      state.location.address = addr;
-      state.addressStatus = 'done';
-      renderLoc();
-      refreshAllThumbnails();
-    }).catch(()=>{
-      state.addressStatus = 'error';
-      renderLoc();
-      refreshAllThumbnails();
-    });
-
-    findNearestPolice(lat, lon).then(ps=>{
-      state.policeStation = ps;
-      state.policeStatus = 'done';
-      renderLoc();
-      refreshAllThumbnails();
-    }).catch(()=>{
-      state.policeStatus = 'error';
-      renderLoc();
-      refreshAllThumbnails();
-    });
+  navigator.geolocation.getCurrentPosition(pos=>{
+    resolveLocation(pos.coords.latitude, pos.coords.longitude, 'gps');
   }, err=>{
     const messages = {
-      1: 'Permission denied — allow location access for this page in your browser/site settings, then tap Refresh.',
+      1: 'Permission denied.',
       2: 'Position unavailable — check that GPS/location services are turned on.',
-      3: 'Location request timed out — tap Refresh to try again.'
+      3: 'Location request timed out.'
     };
-    setLocText(`⚠ ${messages[err.code] || err.message}`);
+    setLocText(`⚠ GPS ${messages[err.code] || err.message} Estimating an approximate location from your network instead…`);
+    tryIpFallback();
   }, { enableHighAccuracy:true, timeout:15000, maximumAge:60000 });
+}
+
+const IP_LOCATION_ENDPOINTS = [
+  'https://ipwho.is/',
+  'https://ipapi.co/json/'
+];
+
+async function tryIpFallback(){
+  for(const url of IP_LOCATION_ENDPOINTS){
+    try{
+      const res = await fetchWithTimeout(url, {}, 10000);
+      if(!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      const lat = data.latitude, lon = data.longitude;
+      if(typeof lat === 'number' && typeof lon === 'number' && data.error !== true && data.success !== false){
+        resolveLocation(lat, lon, 'ip');
+        return;
+      }
+    }catch(e){ /* try next endpoint */ }
+  }
+  setLocText('⚠ Location unavailable — GPS is blocked and the network-based lookup failed too. Photos will be watermarked without location data. Tap Refresh to retry, or check your internet connection.');
+}
+
+function resolveLocation(lat, lon, source){
+  state.location = { lat, lon, address: null, source };
+  state.addressStatus = 'loading';
+  state.policeStatus = 'loading';
+  renderLoc();
+  refreshAllThumbnails();
+
+  reverseGeocode(lat, lon).then(addr=>{
+    state.location.address = addr;
+    state.addressStatus = 'done';
+    renderLoc();
+    refreshAllThumbnails();
+  }).catch(()=>{
+    state.addressStatus = 'error';
+    renderLoc();
+    refreshAllThumbnails();
+  });
+
+  findNearestPolice(lat, lon).then(ps=>{
+    state.policeStation = ps;
+    state.policeStatus = 'done';
+    renderLoc();
+    refreshAllThumbnails();
+  }).catch(()=>{
+    state.policeStatus = 'error';
+    renderLoc();
+    refreshAllThumbnails();
+  });
 }
 
 function renderLoc(){
   const loc = state.location;
   if(!loc) return;
-  let html = `<b>${loc.lat.toFixed(5)}, ${loc.lon.toFixed(5)}</b>`;
+  const badge = loc.source === 'ip'
+    ? ' <span style="color:var(--accent)">· approx. (network-based, GPS unavailable)</span>'
+    : '';
+  let html = `<b>${loc.lat.toFixed(5)}, ${loc.lon.toFixed(5)}</b>${badge}`;
   if(state.addressStatus === 'loading') html += '<br>Resolving address…';
   else if(state.addressStatus === 'error') html += '<br>Address lookup failed (tap Refresh to retry)';
   else if(loc.address) html += `<br>${loc.address}`;
@@ -383,7 +415,8 @@ function buildWatermarkLines(title, capturedAt){
   lines.push(`${vn}   ·   ${title}`);
   lines.push(fmtDate(capturedAt || new Date()));
   if(state.location){
-    lines.push(`${state.location.lat.toFixed(5)}, ${state.location.lon.toFixed(5)}`);
+    const approx = state.location.source === 'ip' ? ' (approx.)' : '';
+    lines.push(`${state.location.lat.toFixed(5)}, ${state.location.lon.toFixed(5)}${approx}`);
     if(state.addressStatus === 'loading') lines.push('Resolving address…');
     else if(state.location.address) lines.push(state.location.address);
   } else {
@@ -619,7 +652,7 @@ async function generateCombinedPDF(){
   }
 }
 
-// ---------- Export: individual photos zipped (< 1MB each) ----------
+// ---------- Export: individual photos zipped (< 500 KB each) ----------
 async function generateIndividualZip(){
   const keys = LABELS.map(l=>l.key).filter(k => state.photos[k]);
   if(!state.vehicleNumber){ setStatus('Enter the vehicle number first', ''); return; }
@@ -634,10 +667,10 @@ async function generateIndividualZip(){
     let total = 0;
     for(const k of keys){
       setStatus(`Compressing ${k}…`, 'busy');
-      const { blob: jpegBlob, canvas } = await compressCanvasToTarget(getStampedCanvas(k), 1_000_000);
+      const { blob: jpegBlob, canvas } = await compressCanvasToTarget(getStampedCanvas(k), 500_000);
       const pdfBlob = await makeSinglePDF(jpegBlob, canvas);
       let finalBlob, ext;
-      if(pdfBlob.size < jpegBlob.size && pdfBlob.size <= 1_000_000){
+      if(pdfBlob.size < jpegBlob.size && pdfBlob.size <= 500_000){
         finalBlob = pdfBlob; ext = 'pdf';
       } else {
         finalBlob = jpegBlob; ext = 'jpg';
